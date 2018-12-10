@@ -25,23 +25,24 @@ import           Database.Beam.Schema.Tables ( DatabaseEntity(..)
 import           Database.Beam.Sqlite.Syntax
 
 import           Database.SQLite.Simple ( Connection, ToRow(..), FromRow(..)
-                                        , Query(..), SQLData(..), field
+                                        , Query(..), SQLData(..)
                                         , execute, execute_
                                         , withStatement, bind, nextRow
                                         , query_, open, close )
 import           Database.SQLite.Simple.FromField ( FromField(..), ResultError(..)
                                                   , returnError, fieldData)
-import           Database.SQLite.Simple.Internal (RowParser(RP), unRP)
-import           Database.SQLite.Simple.Ok (Ok(..))
+import           Database.SQLite.Simple.FromRow (fieldWith)
+import           Database.SQLite.Simple.Internal (RowParser (..))
 import           Database.SQLite.Simple.Types (Null)
+import           Database.SQLite.Simple.Ok (Ok (..))
 
-import           Control.Exception (bracket_, onException, mask)
-import           Control.Monad (forM_, replicateM_)
-import           Control.Monad.Free.Church
+import           Control.Applicative.Free
+import           Control.Exception (Exception, SomeException(..), bracket_, onException, mask)
+import           Control.Monad (forM_)
 import           Control.Monad.IO.Class (MonadIO(..))
 import           Control.Monad.Identity (Identity)
 import           Control.Monad.Reader (ReaderT, MonadReader(..), runReaderT)
-import           Control.Monad.State.Strict (MonadState(..), runStateT)
+import           Control.Monad.Trans (lift)
 
 import qualified Data.ByteString.Char8 as BS
 import           Data.ByteString.Builder (toLazyByteString)
@@ -102,18 +103,21 @@ instance FromBackendRow Sqlite UTCTime
 instance FromBackendRow Sqlite Day
 instance FromBackendRow Sqlite Null
 instance FromBackendRow Sqlite Char where
-  fromBackendRow = do
-    t <- fromBackendRow
-    case T.uncons t of
-      Just (c, _) -> pure c
-      _ -> fail "Need string of size one to parse Char"
+  fromBackendRow = f <$> fromBackendRow
+    where
+      f :: Result TL.Text -> Result Char
+      f (Result x) =
+        case TL.uncons x of
+          Just (c, _) -> Result c
+          Nothing -> Error "Failed to parse Char"
+      f Null = Null
+      f (Error e) = Error e
 instance FromBackendRow Sqlite SqlNull where
-  fromBackendRow =
-    SqlNull <$ (fromBackendRow :: FromBackendRowM Sqlite Null)
+  fromBackendRow = fmap (const SqlNull) <$> (fromBackendRow :: FromBackendRowA Sqlite (Result Null))
 instance FromBackendRow Sqlite LocalTime where
-  fromBackendRow = utcToLocalTime utc <$> fromBackendRow
+  fromBackendRow = fmap (utcToLocalTime utc) <$> fromBackendRow
 instance FromBackendRow Sqlite Scientific where
-  fromBackendRow = unSqliteScientific <$> fromBackendRow
+  fromBackendRow = fmap unSqliteScientific <$> fromBackendRow
 instance FromBackendRow Sqlite SqliteScientific
 
 newtype SqliteScientific = SqliteScientific { unSqliteScientific :: Scientific }
@@ -136,7 +140,7 @@ instance FromField SqliteScientific where
 instance BeamSqlBackend Sqlite
 instance BeamSql92Backend Sqlite
 
--- | 'MonadBeam' instance inside whiche SQLite queries are run. See the
+-- | 'MonadBeam' instance inside which SQLite queries are run. See the
 -- <https://tathougies.github.io/beam/ user guide> for more information
 newtype SqliteM a
   = SqliteM
@@ -149,31 +153,42 @@ newtype BeamSqliteParams = BeamSqliteParams [SQLData]
 instance ToRow BeamSqliteParams where
   toRow (BeamSqliteParams x) = x
 
-newtype BeamSqliteRow a = BeamSqliteRow a
-instance FromBackendRow Sqlite a => FromRow (BeamSqliteRow a) where
-  fromRow = BeamSqliteRow <$> runF (fromBackendRow :: FromBackendRowM Sqlite a) finish step
-      where
-        finish = pure
 
-        step :: FromBackendRowF Sqlite (RowParser a) -> RowParser a
-        step (ParseOneField next) =
-            field >>= next
-        step (PeekField next) =
-            RP $ do
-              ro <- ask
-              st <- get
-              case runStateT (runReaderT (unRP field) ro) st of
-                Ok (a, _) -> unRP (next (Just a))
-                _ -> unRP (next Nothing)
-        step (CheckNextNNull n next) =
-            RP $ do
-              ro <- ask
-              st <- get
-              case runStateT (runReaderT (unRP (replicateM_ n (field :: RowParser Null))) ro) st of
-                Ok ((), st') ->
-                  do put st'
-                     unRP (next True)
-                _ -> unRP (next False)
+newtype BeamSqliteRowError = BeamSqliteRowError T.Text deriving (Eq, Show)
+instance Exception BeamSqliteRowError
+
+newtype BeamSqliteRow a = BeamSqliteRow a
+instance FromBackendRow Sqlite x => FromRow (BeamSqliteRow x) where
+  fromRow = do
+    r <- runAp step (fromBackendRow :: FromBackendRowA Sqlite (Result x))
+    case r of
+      Result x -> pure $ BeamSqliteRow x
+      Null -> RP $ lift $ lift $ Errors [SomeException $ BeamSqliteRowError "Unexpected null parsing BeamSqliteRow"]
+      Error x -> RP $ lift $ lift $ Errors [SomeException $ BeamSqliteRowError x]
+    where
+      step :: FromBackendRowF Sqlite a -> RowParser a
+      step (ParseOneField next) = do
+        fieldWith $ \f -> do
+          case fieldData f of
+            SQLNull -> pure $ next Null
+            _ -> case fromField f of
+                   Ok x -> pure $ next $ Result x
+                   Errors xs -> pure $ next $ Error $
+                     case xs of
+                       [] -> "Unknown error"
+                       _ -> T.pack $ show xs
+      step (ParseAlternative funcLeft funcRight next) = do
+        fieldWith $ \f -> do
+          case fieldData f of
+            SQLNull -> pure $ next Null
+            _ -> case fromField f of
+                   Ok x -> pure $ next $ funcLeft x
+                   _ -> case fromField f of
+                          Ok x -> pure $ next $ funcRight x
+                          Errors xs -> pure $ next $ Error $
+                            case xs of
+                              [] -> "Unknown error"
+                              _ -> T.pack $ show xs
 
 -- | URI syntax for use with 'withDbConnection'. See documentation for
 -- 'BeamURIOpeners' for more information.
@@ -218,7 +233,7 @@ instance MonadBeam SqliteCommandSyntax Sqlite Connection SqliteM where
                let nextRow' = liftIO (nextRow stmt) >>= \x ->
                               case x of
                                 Nothing -> pure Nothing
-                                Just (BeamSqliteRow row) -> pure row
+                                Just (BeamSqliteRow row) -> pure $ Just row
                runReaderT (runSqliteM (action nextRow')) (logger, conn)
   runReturningMany SqliteCommandInsert {} _ =
       fail . mconcat $

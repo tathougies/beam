@@ -23,9 +23,11 @@ module Database.Beam.Postgres.Connection
 
   , postgresUriSyntax ) where
 
+import           Control.Applicative.Free
 import           Control.Exception (Exception, throwIO)
 import           Control.Monad.Free.Church
 import           Control.Monad.IO.Class
+import           Control.Monad.Trans.Except
 
 import           Database.Beam hiding (runDelete, runUpdate, runInsert, insert)
 import           Database.Beam.Schema.Tables
@@ -48,7 +50,7 @@ import qualified Database.PostgreSQL.Simple.Internal as Pg
   , exec, throwResultError )
 import qualified Database.PostgreSQL.Simple.Internal as PgI
 import qualified Database.PostgreSQL.Simple.Ok as Pg
-import qualified Database.PostgreSQL.Simple.Types as Pg (Null(..), Query(..))
+import qualified Database.PostgreSQL.Simple.Types as Pg (Query(..))
 
 import           Control.Monad.Reader
 import           Control.Monad.State
@@ -56,7 +58,6 @@ import           Control.Monad.State
 import           Data.ByteString (ByteString)
 import           Data.ByteString.Builder (toLazyByteString, byteString)
 import qualified Data.ByteString.Lazy as BL
-import           Data.Proxy
 import           Data.String
 import qualified Data.Text as T
 import           Data.Text.Encoding (decodeUtf8)
@@ -123,15 +124,17 @@ pgRenderSyntax conn (PgSyntax mkQuery) =
 
 -- | An error that may occur while parsing a row
 data PgRowReadError
-    = PgRowReadNoMoreColumns !CInt !CInt
+    = PgRowReadNotEnoughColumns !CInt !CInt
       -- ^ We attempted to read more columns than postgres returned. First
-      -- argument is the zero-based index of the column we attempted to read,
-      -- and the second is the total number of columns
+      -- argument is the number of columns required to successfully parse
+      -- the result, and the second is the number of columns we got.
     | PgRowCouldNotParseField !CInt
       -- ^ There was an error while parsing the field. The first argument gives
       -- the zero-based index of the column that could not have been
       -- parsed. This is usually caused by your Haskell schema type being
       -- incompatible with the one in the database.
+    | PgRowUnexpectedNull
+      -- ^ Row parsing produced a Result of Null.
     deriving Show
 
 instance Exception PgRowReadError
@@ -145,51 +148,54 @@ getFields res = do
 
   mapM getField [0..colCount - 1]
 
-runPgRowReader ::
-  Pg.Connection -> Pg.Row -> Pg.Result -> [Pg.Field] -> FromBackendRowM Postgres a -> IO (Either PgRowReadError a)
-runPgRowReader conn rowIdx res fields readRow =
-  Pg.nfields res >>= \(Pg.Col colCount) ->
-  runF readRow finish step 0 colCount fields
+runPgRowReader
+  :: Pg.Connection
+  -> Pg.Row
+  -> Pg.Result
+  -> [Pg.Field]
+  -> FromBackendRowA Postgres (Result a)
+  -> IO (Either PgRowReadError a)
+runPgRowReader conn rowIdx res fields readRow = do
+  (Pg.Col colCount) <- Pg.nfields res
+  let needCols = fromIntegral $ valuesNeeded readRow
+  if needCols <= colCount
+    then do
+      er <- runExceptT $ evalStateT (runAp step readRow) $ zip [0..(colCount - 1)] fields
+      pure $ case er of
+               Right (Result x) -> Right x
+               Right Null -> Left PgRowUnexpectedNull
+               Right _ -> error "Internal error"
+               Left x -> Left x
+    else
+      pure $ Left $ PgRowReadNotEnoughColumns needCols colCount
   where
-    step (ParseOneField _) curCol colCount [] = pure (Left (PgRowReadNoMoreColumns curCol colCount))
-    step (ParseOneField _) curCol colCount _
-      | curCol >= colCount = pure (Left (PgRowReadNoMoreColumns curCol colCount))
-    step (ParseOneField next) curCol colCount remainingFields =
-      let next' Nothing _ _ _ = pure (Left (PgRowCouldNotParseField curCol))
-          next' (Just {}) _ _ [] = fail "Internal error"
-          next' (Just x) curCol' colCount' (_:remainingFields') = next x (curCol' + 1) colCount' remainingFields'
-      in step (PeekField next') curCol colCount remainingFields
-
-    step (PeekField next) curCol colCount [] = next Nothing curCol colCount []
-    step (PeekField next) curCol colCount remainingFields
-      | curCol >= colCount = next Nothing curCol colCount remainingFields
-    step (PeekField next) curCol colCount remainingFields@(field:_) =
-      do fieldValue <- Pg.getvalue res rowIdx (Pg.Col curCol)
-         res' <- Pg.runConversion (Pg.fromField field fieldValue) conn
-         case res' of
-           Pg.Errors {} -> next Nothing curCol colCount remainingFields
-           Pg.Ok x -> next (Just x) curCol colCount remainingFields
-
-    step (CheckNextNNull n next) curCol colCount remainingFields =
-      doCheckNextN (fromIntegral n) (curCol :: CInt) (colCount :: CInt) remainingFields >>= \yes ->
-      next yes (curCol + if yes then fromIntegral n else 0) colCount (if yes then drop (fromIntegral n) remainingFields else remainingFields)
-
-    doCheckNextN 0 _ _ _ = pure False
-    doCheckNextN n curCol colCount remainingFields
-      | curCol + n > colCount = pure False
-      | otherwise =
-        let fieldsInQuestion = zip [curCol..] (take (fromIntegral n) remainingFields)
-        in readAndCheck fieldsInQuestion
-
-    readAndCheck [] = pure True
-    readAndCheck ((i, field):xs) =
-      do fieldValue <- Pg.getvalue res rowIdx (Pg.Col i)
-         res' <- Pg.runConversion (Pg.fromField field fieldValue) conn
-         case res' of
-           Pg.Errors _ -> pure False
-           Pg.Ok Pg.Null -> readAndCheck xs
-
-    finish x _ _ _ = pure (Right x)
+    step :: FromBackendRowF Postgres a -> StateT [(CInt, Pg.Field)] (ExceptT PgRowReadError IO) a
+    step (ParseOneField next) = do
+      (curCol, field):fs <- get
+      put fs
+      fv <- liftIO $ Pg.getvalue res rowIdx (Pg.Col curCol)
+      case fv of
+        Nothing -> pure $ next Null
+        Just _ -> do
+          r <- liftIO $ Pg.runConversion (Pg.fromField field fv) conn
+          case r of
+            Pg.Ok x -> pure $ next $ Result x
+            Pg.Errors _ -> lift $ throwE $ PgRowCouldNotParseField curCol
+    step (ParseAlternative f g next) = do
+      (curCol, field):fs <- get
+      put fs
+      fv <- liftIO $ Pg.getvalue res rowIdx (Pg.Col curCol)
+      case fv of
+        Nothing -> pure $ next Null
+        Just _ -> do
+          r1 <- liftIO $ Pg.runConversion (Pg.fromField field fv) conn
+          case fmap f r1 of
+            Pg.Ok (Result x) -> pure $ next $ Result x
+            _ -> do
+              r2 <- liftIO $ Pg.runConversion (Pg.fromField field fv) conn
+              case fmap g r2 of
+                Pg.Ok (Result x) -> pure $ next $ Result x
+                _ -> lift $ throwE $ PgRowCouldNotParseField curCol
 
 withPgDebug :: (String -> IO ()) -> Pg.Connection -> Pg a -> IO (Either PgError a)
 withPgDebug dbg conn (Pg action) =
@@ -212,7 +218,7 @@ withPgDebug dbg conn (Pg action) =
                    finishUp (PgStreamDone (Left err)) = pure (Left err)
                    finishUp (PgStreamContinue next') = next' Nothing >>= finishUp
 
-                   columnCount = fromIntegral $ valuesNeeded (Proxy @Postgres) (Proxy @x)
+                   columnCount = fromIntegral $ valuesNeeded (fromBackendRow :: FromBackendRowA Postgres (Result x))
                in Pg.foldWith_ (Pg.RP (put columnCount >> ask)) conn (Pg.Query query) (PgStreamContinue nextStream) runConsumer >>= finishUp
       step (PgRunReturning (PgCommandSyntax PgCommandTypeDataUpdateReturning syntax) mkProcess next) =
         do query <- pgRenderSyntax conn syntax
@@ -271,7 +277,7 @@ withPgDebug dbg conn (Pg action) =
         getFields res >>= \fields ->
         runPgRowReader conn rowIdx res fields fromBackendRow >>= \case
           Left err -> pure (PgStreamDone (Left (PgRowParseError err)))
-          Right r -> pure (PgStreamContinue (next (Just r)))
+          Right r -> pure (PgStreamContinue (next $ Just r))
       stepProcess (PgRunReturning _ _ _) _ = pure (PgStreamDone (Left (PgInternalError "Nested queries not allowed")))
       stepProcess (PgLiftWithHandle _ _) _ = pure (PgStreamDone (Left (PgInternalError "Nested queries not allowed")))
 
