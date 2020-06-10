@@ -401,6 +401,28 @@ instance ( Selector f, IsDatabaseEntity be x, DatabaseEntityDefaultRequirements 
   autoDbSettings' = M1 (K1 (DatabaseEntity (dbEntityAuto name)))
     where name = T.pack (selName (undefined :: S1 f (K1 Generic.R (DatabaseEntity be db x)) p))
 
+instance ( Selector f
+         , Generic (DatabaseSettings be innerDb)
+         , GAutoDbSettings (Rep (DatabaseSettings be innerDb) ())
+         , Database be innerDb
+         ) =>
+  GAutoDbSettings (S1 f (K1 Generic.R (innerDb (DatabaseEntity be outerDb))) p) where
+  autoDbSettings' =
+    M1 (K1 (runIdentity $ zipTables (Proxy :: Proxy be)
+                          (\_ -> pure . changeDatabaseEntityDb)
+                          settings
+                          settings :: innerDb (DatabaseEntity be outerDb)))
+    where outerPrefix = T.pack (selName (undefined :: S1 f (Rec0 (innerDb (DatabaseEntity be outerDb))) ()))
+          settings :: DatabaseSettings be innerDb
+          settings = defaultDbSettings
+          changeDatabaseEntityDb
+            :: forall entityType
+            .  DatabaseEntity be innerDb entityType
+            -> DatabaseEntity be outerDb entityType
+          changeDatabaseEntityDb (DatabaseEntity a) =
+            DatabaseEntity (over dbEntityName (`mappend` outerPrefix) a)
+
+
 class GZipDatabase be f g h x y z where
   gZipDatabase :: Applicative m =>
                   (Proxy f, Proxy g, Proxy h, Proxy be)
@@ -419,6 +441,12 @@ instance (IsDatabaseEntity be tbl, DatabaseEntityRegularRequirements be tbl) =>
 
   gZipDatabase _ combine ~(K1 x) ~(K1 y) =
     K1 <$> combine x y
+
+instance Database be db =>
+  GZipDatabase be f g h (K1 Generic.R (db f)) (K1 Generic.R (db g)) (K1 Generic.R (db h)) where
+
+  gZipDatabase _ combine ~(K1 x) ~(K1 y) =
+    K1 <$> zipTables (Proxy :: Proxy be) combine x y
 
 data Lenses (t :: (* -> *) -> *) (f :: * -> *) x
 data LensFor t x where
