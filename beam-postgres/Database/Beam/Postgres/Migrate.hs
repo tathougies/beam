@@ -360,6 +360,27 @@ getDbConstraintsForSchemas subschemas conn =
 
           pure (columnChecks ++ notNullChecks)
 
+     uniqueChecks <- do
+       uniqueTblCols <- do
+         tblUniqs' <- Pg.query_ conn (fromString (unlines [ "SELECT cl.relname, conname"
+                                                          , "FROM pg_constraint co"
+                                                          , "JOIN pg_namespace na ON co.connamespace = na.oid"
+                                                          , "JOIN pg_class cl ON cl.relfilenode = co.conrelid"
+                                                          , "WHERE co.contype = 'u'"
+                                                          ]))
+         pure $ flip fmap tblUniqs' $ \(tbl, nm') ->
+           let splitConstraint =  T.split (=='_') nm'
+               withoutKeyId = T.intercalate "_" . join (take . (subtract 1) . length) $ splitConstraint
+               withoutTableName = T.drop (T.length tbl + 1) withoutKeyId
+           in (tbl,withoutTableName)
+
+       pure $ flip fmap uniqueTblCols $ \(tbl,nm) ->
+         Db.SomeDatabasePredicate
+           (Db.TableColumnHasConstraint
+             (Db.QualifiedName Nothing tbl)
+             nm
+             (Db.constraintDefinitionSyntax Nothing Db.uniqueColumnConstraintSyntax Nothing) :: Db.TableColumnHasConstraint Postgres)
+
      primaryKeys <-
        map (\(relnm, cols) -> Db.SomeDatabasePredicate (Db.TableHasPrimaryKey (Db.QualifiedName Nothing relnm) (V.toList cols))) <$>
        Pg.query_ conn (fromString (unlines [ "SELECT c.relname, array_agg(a.attname ORDER BY k.n ASC)"
@@ -373,7 +394,7 @@ getDbConstraintsForSchemas subschemas conn =
      let enumerations =
            map (\(enumNm, _, options) -> Db.SomeDatabasePredicate (PgHasEnum enumNm (V.toList options))) enumerationData
 
-     pure (tblsExist ++ columnChecks ++ primaryKeys ++ enumerations)
+     pure (tblsExist ++ columnChecks ++ primaryKeys ++ enumerations ++ uniqueChecks)
 
 -- * Postgres-specific data types
 
