@@ -106,6 +106,11 @@ module Database.Beam.Postgres.PgSpecific
   , lowerInc_, upperInc_, lowerInf_, upperInf_
   , rangeMerge_
 
+    -- * Postgres @EXTRACT@ fields
+  , IsPgExtractFieldSyntax(..)
+  , century_, decade_, dow_, doy_, epoch_, isodow_, isoyear_
+  , microseconds_, milliseconds_, millennium_, quarter_, week_
+
     -- ** Postgres functions and aggregates
   , pgBoolOr, pgBoolAnd, pgStringAgg, pgStringAggOver
 
@@ -142,7 +147,7 @@ import           Data.Proxy
 import           Data.Scientific (Scientific, formatScientific, FPFormat(Fixed))
 import           Data.String
 import qualified Data.Text as T
-import           Data.Time (LocalTime)
+import           Data.Time (LocalTime, NominalDiffTime)
 import           Data.Type.Bool
 import qualified Data.Vector as V
 #if !MIN_VERSION_base(4, 11, 0)
@@ -1465,6 +1470,72 @@ instance HasDefaultSqlDataType Postgres a
     => HasDefaultSqlDataType Postgres (V.Vector a) where
   defaultSqlDataType _ be embedded =
       pgUnboundedArrayType (defaultSqlDataType (Proxy :: Proxy a) be embedded)
+
+-- ** Extract
+
+class IsSql92ExtractFieldSyntax extractField => IsPgExtractFieldSyntax extractField where
+  centuryField :: extractField
+  decadeField :: extractField
+  dowField :: extractField
+  doyField :: extractField
+  epochField :: extractField
+  isodowField :: extractField
+  isoyearField :: extractField
+  microsecondsField :: extractField
+  millisecondsField :: extractField
+  millenniumField :: extractField
+  quarterField :: extractField
+  weekField :: extractField
+
+instance IsPgExtractFieldSyntax PgExtractFieldSyntax where
+  centuryField = PgExtractFieldSyntax (emit "CENTURY")
+  decadeField = PgExtractFieldSyntax (emit "DECADE")
+  dowField = PgExtractFieldSyntax (emit "DOW")
+  doyField = PgExtractFieldSyntax (emit "DOY")
+  epochField = PgExtractFieldSyntax (emit "EPOCH")
+  isodowField = PgExtractFieldSyntax (emit "ISODOW")
+  isoyearField = PgExtractFieldSyntax (emit "ISOYEAR")
+  microsecondsField = PgExtractFieldSyntax (emit "MICROSECONDS")
+  millisecondsField = PgExtractFieldSyntax (emit "MILLISECONDS")
+  millenniumField  = PgExtractFieldSyntax (emit "MILLENNIUM")
+  quarterField = PgExtractFieldSyntax (emit "QUARTER")
+  weekField = PgExtractFieldSyntax (emit "WEEK")
+
+century_ :: HasSqlDate tgt => ExtractField Postgres tgt Int32
+century_ = ExtractField centuryField
+
+decade_ :: HasSqlDate tgt => ExtractField Postgres tgt Int32
+decade_ = ExtractField decadeField
+
+dow_ :: HasSqlDate tgt => ExtractField Postgres tgt Int32
+dow_ = ExtractField dowField
+
+doy_ :: HasSqlDate tgt => ExtractField Postgres tgt Int32
+doy_ = ExtractField doyField
+
+epoch_ :: HasSqlTime tgt => ExtractField Postgres tgt NominalDiffTime
+epoch_ = ExtractField epochField
+
+isodow_ :: HasSqlDate tgt => ExtractField Postgres tgt Int32
+isodow_ = ExtractField isodowField
+
+isoyear_ :: HasSqlDate tgt => ExtractField Postgres tgt Int32
+isoyear_ = ExtractField isoyearField
+
+microseconds_ :: HasSqlTime tgt => ExtractField Postgres tgt Int32
+microseconds_ = ExtractField microsecondsField
+
+milliseconds_ :: HasSqlTime tgt => ExtractField Postgres tgt Int32
+milliseconds_ = ExtractField millisecondsField
+
+millennium_ :: HasSqlDate tgt => ExtractField Postgres tgt Int32
+millennium_ = ExtractField millenniumField
+
+quarter_ :: HasSqlDate tgt => ExtractField Postgres tgt Int32
+quarter_ = ExtractField quarterField
+
+week_ :: HasSqlDate tgt => ExtractField Postgres tgt Int32
+week_ = ExtractField weekField
 
 -- $full-text-search
 --
